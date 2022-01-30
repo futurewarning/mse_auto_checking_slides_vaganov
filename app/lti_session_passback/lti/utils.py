@@ -1,6 +1,8 @@
 import logging
 logger = logging.getLogger('root_logger')
 from app.main.checks_config.parser import sld_num
+from typing import Optional, Union, TypeVar
+from pydantic import BaseModel, ValidationError, validator, root_validator
 
 TITLE = 'context_title'
 RETURN_URL = 'launch_presentation_return_url'
@@ -76,40 +78,66 @@ def extract_passback_params(data):
             raise KeyError("{} doesn't include {}. Must inslude: {}".format(data, param_key, PASSBACK_PARAMS))
     return params
 
+class Criteria(BaseModel):
+    slides_number: Union[str, bool, list] = sld_num['bsc']  #faulty
+    detect_additional: bool = True
+    slides_enum: bool = True
+    slides_headers: bool = True
+    goals_slide: bool = True
+    probe_slide: bool = True
+    actual_slide: bool = True
+    conclusion_slide: bool = True
+    slide_every_task: Union[bool, int] = 50
+    conclusion_actual: Union[bool, int] = 50
+    conclusion_along: bool = True
+
+    class Config:
+      validate_assignment = True
+      validate_all = True
+
+    @validator('slides_number')
+    def slides_num_validator(cls, value):
+        if value not in ['bsc', 'msc', False] and type(value) != list:
+            allowed_type = cls.__fields__['slides_number'].type_
+            raise ValueError(f'should be of {allowed_type}(str: "bsc", "msc")')
+        return sld_num[value] if type(value) == str else value
+
+    @validator('slide_every_task', 'conclusion_actual')
+    def esc_true_validator(cls, value):
+        if value == True:
+            allowed_type = cls.__fields__['conclusion_actual'].type_
+            raise ValueError(f'should be of {allowed_type}(bool: only False to disable)')
+        return value
+
+    @root_validator()
+    def check_failing(cls, values):
+        present = values.keys()
+        required = set(cls.__fields__.keys()) #!
+        failing_keys = required.difference(present)
+        if failing_keys:
+          raise ValueError(f'Issues are present in the fields: {failing_keys}')
+        return values
+
+    @root_validator()
+    def _set_fields(cls, values):
+        values['slides_number'] = {'sld_num': values.get('slides_number', None),
+                                   'detect_additional': values.get('detect_additional', None)}
+        values.pop('detect_additional', None)
+        return values
+
 def launch_sanity_check(custom, task_info):
     try:
-        order = ('slides_number', 'slides_enum', 'slides_headers', 'goals_slide',
-                  'probe_slide', 'actual_slide', 'conclusion_slide', 'slide_every_task',
-                  'conclusion_actual', 'conclusion_along')
-        detect_additional = custom.get('detect_additional', 'True')
-        slides_number = custom.get('slides_number', 'bsc')
-        eval_criteria = dict((k, eval(custom[k])) for k in order if k in custom and k != 'slides_number')
-    except NameError:
-        logger.warning("Error in declared launch values is present in {0}(id={1}). {2}'s checks will be defaulted".format(*task_info.values()))
-        return dict()
+        criteria = Criteria.parse_obj(custom)
+    except ValidationError as e:
+        errors = e.errors()
+        for i in errors:
+            custom.pop(i['loc'][0], None)
+            field_err = (
+                         f"Error in {i['loc'][0]}: {i['msg']}[{i['type']}]. "
+                         f"Defaulting for task {task_info['title']}, id={task_info['id']}."
+            )
+            logger.warning(field_err)
 
-    int_false_checks = ['slide_every_task', 'conclusion_actual']
-    check_types = {
-        **dict.fromkeys(['slides_enum', 'slides_headers', 'goals_slide', 'detect_additional', 'probe_slide',
-                         'actual_slide', 'conclusion_slide', 'conclusion_along'], (bool)),
-        **dict.fromkeys(int_false_checks, (int, bool))
-        }
+        criteria = Criteria.parse_obj(custom)
 
-    failed_types = [k for k, v in eval_criteria.items() if not isinstance(v, check_types[k]) and k != 'slides_number']
-    [failed_types.append(check) for check in int_false_checks if custom.get(check) == 'True']
-
-    detect_additional = True if not isinstance(eval(detect_additional), bool) else eval(detect_additional)
-    if slides_number not in ['bsc', 'msc', 'False'] and not isinstance(eval(slides_number), (list)):
-        failed_types.append('slides_number')
-    else:
-        eval_criteria['slides_number'] = {'sld_num': sld_num.get(slides_number, None) or eval(slides_number),
-                                          'detect_additional': detect_additional} if slides_number != 'False' else False
-
-    if failed_types:
-        [eval_criteria.pop(key, None) for key in failed_types]
-        logger.warning(f"The following check types don't match their designated types: {', '.join(failed_types)}.")
-        logger.warning("They will be disabled for task {0}(id={1}) in {2}'s checks".format(*task_info.values()))
-
-    reordered_dict = {k: eval_criteria.get(k, False) for k in order}
-
-    return reordered_dict
+    return criteria.dict()
